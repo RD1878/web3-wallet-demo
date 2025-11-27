@@ -1,50 +1,58 @@
 import { useEffect, useState, useCallback } from "react";
+import {
+    BrowserProvider,
+    JsonRpcSigner,
+    formatEther,
+    Contract,
+    formatUnits,
+} from "ethers";
 
-// Импортируем из ethers v6:
-// - BrowserProvider: обёртка вокруг window.ethereum (EIP-1193 провайдер)
-// - JsonRpcSigner: тип для signer, который подписывает транзакции/сообщения
-// - formatEther: утилита для перевода значения из Wei (целое число) в строку ETH (с плавающей точкой)
-import { BrowserProvider, JsonRpcSigner, formatEther } from "ethers";
+import { erc20Abi } from "./abi/erc20"; // наш минимальный ABI для ERC-20
 
-// Типы статуса подключения — удобно держать как union-тип
 type ConnectionState = "disconnected" | "connecting" | "connected" | "error";
 
-// Описываем, какие данные хотим хранить про кошелёк в одном объекте состояния
+// Расширяем состояние кошелька счётчиками для токена
 interface WalletState {
-    address: string | null;   // текущий адрес пользователя или null, если не подключен
-    chainId: number | null;   // ID сети (1 для mainnet, 11155111 для Sepolia и т.д.)
-    balanceEth: string | null; // баланс в ETH, приведённый к строке
-    status: ConnectionState;  // текущий статус подключения
-    error: string | null;     // текст ошибки для отображения в UI
+    address: string | null;
+    chainId: number | null;
+    balanceEth: string | null;
+
+    // Поля, связанные с токеном (ERC-20)
+    tokenSymbol: string | null;
+    tokenBalance: string | null; // уже форматированное значение с учётом decimals
+
+    status: ConnectionState;
+    error: string | null;
 }
+
+// Адрес контракта USDC в сети Ethereum mainnet (как пример).
+// В реальном проекте такие адреса обычно лежат в конфиге.
+const USDC_MAINNET_ADDRESS = "0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48";
+
+// Ожидаемый chainId (1 = Ethereum mainnet)
+const EXPECTED_CHAIN_ID = 1;
 
 function App() {
     const [wallet, setWallet] = useState<WalletState>({
         address: null,
         chainId: null,
         balanceEth: null,
+        tokenSymbol: null,
+        tokenBalance: null,
         status: "disconnected",
         error: null,
     });
+
     const [provider, setProvider] = useState<BrowserProvider | null>(null);
     const [signer, setSigner] = useState<JsonRpcSigner | null>(null);
 
-    // 1. На этапе монтирования компонента проверяем, есть ли window.ethereum
-    //    и, если есть, создаём BrowserProvider.
+    // 1. Инициализируем BrowserProvider
     useEffect(() => {
-        // window может быть undefined в SSR-сценариях, поэтому сначала проверяем тип
         if (typeof window !== "undefined" && (window as any).ethereum) {
-            // Берём "сырой" EIP-1193 провайдер, который внедряет MetaMask (или другой кошелёк)
             const eth = (window as any).ethereum;
-
-            // Создаём BrowserProvider — адаптер ethers поверх EIP-1193 провайдера
             const browserProvider = new BrowserProvider(eth);
-
-            // Сохраняем его в состояние, чтобы использовать дальше
             setProvider(browserProvider);
         } else {
-            // Если провайдер не найден, сразу устанавливаем статус ошибки,
-            // чтобы в UI показать сообщение "Установите MetaMask"
             setWallet((prev) => ({
                 ...prev,
                 status: "error",
@@ -53,23 +61,25 @@ function App() {
         }
     }, []);
 
-    // Хелпер для "очистки" состояния кошелька
-    // useCallback, чтобы не создавать новую функцию на каждый рендер
+    // Хелпер для сброса состояния
     const resetWalletState = useCallback(() => {
         setWallet({
             address: null,
             chainId: null,
             balanceEth: null,
+            tokenSymbol: null,
+            tokenBalance: null,
             status: "disconnected",
             error: null,
         });
         setSigner(null);
     }, []);
 
-    // Основная функция подключения кошелька по кнопке "Подключить кошелёк"
+    // Функция, которая:
+    // 1) подключает кошелёк
+    // 2) читает ETH баланс и chainId
+    // 3) читает данные ERC-20 токена (symbol, decimals, balanceOf)
     const connectWallet = useCallback(async () => {
-        // Если провайдер ещё не инициализирован (например, не нашли window.ethereum),
-        // не пытаемся подключаться и показываем ошибку
         if (!provider) {
             setWallet((prev) => ({
                 ...prev,
@@ -80,125 +90,104 @@ function App() {
         }
 
         try {
-            // Переводим статус в "connecting", чтобы UI мог показать спиннер/текст "Подключение..."
             setWallet((prev) => ({ ...prev, status: "connecting", error: null }));
 
-            // Достаём исходный EIP-1193 провайдер из window
             const eth = (window as any).ethereum;
 
-            // Запрашиваем у пользователя доступ к аккаунтам.
-            // Метод eth_requestAccounts:
-            // - если пользователь уже дал доступ, вернёт массив адресов
-            // - если нет, покажет всплывающее окно в MetaMask
+            // Запрашиваем доступ к аккаунтам
             const accounts: string[] = await eth.request({
                 method: "eth_requestAccounts",
             });
 
-            // Если кошелёк вернул пустой массив, это значит, что ни один аккаунт
-            // не был предоставлен сайту (редко, но лучше явно обработать)
             if (!accounts || accounts.length === 0) {
                 throw new Error("Нет доступных аккаунтов");
             }
 
-            // Берём первый аккаунт в качестве активного (стандартный сценарий)
             const userAddress = accounts[0];
 
-            // Получаем signer для этого адреса.
-            // Signer знает, как отправлять транзакции/подписывать сообщения
-            // от имени этого пользователя (через кошелёк).
+            // Получаем signer и сеть
             const nextSigner = await provider.getSigner(userAddress);
-
-            // Получаем информацию о сети:
-            // - chainId: уникальный ID сети
-            // - name и другие поля, если понадобятся позже
             const network = await provider.getNetwork();
 
-            // Получаем баланс этого адреса в Wei (целое число, BigInt)
+            // Читаем ETH баланс
             const balanceWei = await provider.getBalance(userAddress);
-
-            // formatEther переводит баланс из Wei в строку в ETH (с десятичной точкой)
             const balanceEth = formatEther(balanceWei);
 
-            // Обновляем состояние:
-            // - сохраняем signer
-            // - выставляем адрес, chainId, отформатированный баланс и статус "connected"
+            // Создаём объект контракта ERC-20.
+            // Важно: для чтения (view-функции) нам достаточно provider.
+            const tokenContract = new Contract(
+                USDC_MAINNET_ADDRESS, // адрес контракта в сети
+                erc20Abi,             // наш минимальный ABI
+                provider              // читаем через провайдер (без необходимости signer)
+            );
+
+            // Читаем символ токена и decimals параллельно
+            const [symbol, decimals] = await Promise.all([
+                tokenContract.symbol(),
+                tokenContract.decimals(),
+            ]);
+
+            // Читаем "сырое" значение баланса (целое число без учёта decimals)
+            const rawTokenBalance = await tokenContract.balanceOf(userAddress);
+
+            // formatUnits учитывает decimals и возвращает строку с плавающей запятой,
+            // например: "12.345678"
+            const formattedTokenBalance = formatUnits(rawTokenBalance, decimals);
+
             setSigner(nextSigner);
             setWallet({
                 address: userAddress,
-                chainId: Number(network.chainId), // приводим к number для удобства
+                chainId: Number(network.chainId),
                 balanceEth,
+                tokenSymbol: symbol,
+                tokenBalance: formattedTokenBalance,
                 status: "connected",
                 error: null,
             });
         } catch (error: any) {
-            // Любая ошибка (например, пользователь нажал "Cancel" в MetaMask)
-            // попадает сюда. Логируем в консоль для разработчика...
             console.error(error);
-
-            // ...и обновляем состояние, чтобы показать человеку понятное сообщение.
             setWallet((prev) => ({
                 ...prev,
                 status: "error",
-                error: error?.message ?? "Ошибка при подключении кошелька",
+                error: error?.message ?? "Ошибка при подключении кошелька или чтении токена",
             }));
         }
     }, [provider]);
 
-    // Подписка на события кошелька:
-    // - accountsChanged: пользователь сменил аккаунт или отключил сайт
-    // - chainChanged: пользователь сменил сеть (например, с mainnet на Sepolia)
+    // Подписка на события MetaMask (аналогично модулю 1)
     useEffect(() => {
         const eth = (window as any).ethereum;
-        if (!eth) return; // если нет провайдера, подписываться не на что
+        if (!eth) return;
 
-        // Обработчик смены аккаунтов
         const handleAccountsChanged = (accounts: string[]) => {
             if (!accounts || accounts.length === 0) {
-                // Сценарий: пользователь отключил сайт в MetaMask.
-                // Мы сбрасываем состояние до "не подключено".
                 resetWalletState();
             } else {
-                // Сценарий: пользователь переключил аккаунт в кошельке.
-                // Обычно dApp либо:
-                // 1) обновляет состояние "вручную",
-                // 2) либо переиспользует логику connectWallet, чтобы пересчитать всё.
+                // Переподключаемся и перечитываем данные токена для нового аккаунта
                 connectWallet();
             }
         };
 
-        // Обработчик смены сети
         const handleChainChanged = (_chainIdHex: string) => {
-            // MetaMask официально рекомендует перезагружать страницу
-            // при смене сети, но для демо мы просто переиспользуем connectWallet,
-            // чтобы прочитать новый chainId и баланс в новой сети.
+            // Смена сети => перечитываем всё (в том числе баланс токена в новой сети).
             connectWallet();
         };
 
-        // Подписываемся на события.
-        // Важно: это API самого кошелька (EIP-1193), а не React.
         eth.on("accountsChanged", handleAccountsChanged);
         eth.on("chainChanged", handleChainChanged);
 
-        // Возвращаем функцию очистки (unsubscribe), чтобы не плодить лишние подписки
         return () => {
             if (!eth.removeListener) return;
-
             eth.removeListener("accountsChanged", handleAccountsChanged);
             eth.removeListener("chainChanged", handleChainChanged);
         };
     }, [connectWallet, resetWalletState]);
 
-    // Удобное представление "короткого адреса" для UI, чтобы не занимать всю ширину
     const shortAddress =
         wallet.address && `${wallet.address.slice(0, 6)}...${wallet.address.slice(-4)}`;
 
-    // chainId, который мы "ожидаем" для этого приложения.
-    // Здесь для примера — mainnet (1). В реальном dApp подставишь нужную сеть.
-    const expectedChainId = 1;
-
-    // Флаг, что пользователь сейчас в "не той" сети
     const isWrongNetwork =
-        wallet.chainId !== null && wallet.chainId !== expectedChainId;
+        wallet.chainId !== null && wallet.chainId !== EXPECTED_CHAIN_ID;
 
     return (
         <div
@@ -219,23 +208,20 @@ function App() {
                     background: "#020617",
                     border: "1px solid #1f2937",
                     width: "100%",
-                    maxWidth: "480px",
+                    maxWidth: "520px",
                     boxShadow: "0 20px 30px rgba(0,0,0,0.4)",
                 }}
             >
                 <h1 style={{ fontSize: "1.5rem", marginBottom: "1rem" }}>
-                    Web3 Wallet Demo
+                    ERC-20 Token Reader
                 </h1>
 
-                {/* Если провайдер не найден (нет MetaMask), показываем понятное сообщение */}
                 {!provider && (
                     <p>
-                        Кошелёк не найден. Пожалуйста, установите расширение MetaMask или
-                        другой Ethereum‑кошелёк.
+                        Кошелёк не найден. Установите MetaMask или другой Ethereum‑кошелёк.
                     </p>
                 )}
 
-                {/* Стартовый экран: кошелёк есть, но подключение ещё не выполнено */}
                 {provider && wallet.status === "disconnected" && (
                     <button
                         onClick={connectWallet}
@@ -244,20 +230,17 @@ function App() {
                             borderRadius: "999px",
                             border: "none",
                             cursor: "pointer",
-                            background:
-                                "linear-gradient(135deg, #4f46e5, #06b6d4)",
+                            background: "linear-gradient(135deg, #4f46e5, #06b6d4)",
                             color: "white",
                             fontWeight: 600,
                         }}
                     >
-                        Подключить кошелёк
+                        Подключить кошелёк и прочитать USDC
                     </button>
                 )}
 
-                {/* В момент подключения показываем текст. Можно заменить на спиннер. */}
-                {wallet.status === "connecting" && <p>Подключение кошелька…</p>}
+                {wallet.status === "connecting" && <p>Подключение и чтение данных…</p>}
 
-                {/* Состояние, когда мы успешно подключились и уже знаем адрес/баланс/chainId */}
                 {wallet.status === "connected" && (
                     <div style={{ display: "grid", gap: "0.5rem", marginTop: "0.5rem" }}>
                         <div>
@@ -265,34 +248,59 @@ function App() {
                             <span>{shortAddress}</span>
                         </div>
                         <div>
-                            <span style={{ opacity: 0.7 }}>Баланс:</span>{" "}
+                            <span style={{ opacity: 0.7 }}>ETH баланс:</span>{" "}
                             <span>{wallet.balanceEth} ETH</span>
                         </div>
                         <div>
                             <span style={{ opacity: 0.7 }}>ChainId:</span>{" "}
                             <span>{wallet.chainId}</span>
                         </div>
-                        {/* Если сеть не та, мягко предупреждаем пользователя */}
+
                         {isWrongNetwork && (
                             <p style={{ color: "#f97316", marginTop: "0.5rem" }}>
-                                Внимание: вы в другой сети. Ожидается chainId {expectedChainId}.
+                                Внимание: пример рассчитан на Ethereum mainnet (chainId{" "}
+                                {EXPECTED_CHAIN_ID}).
                             </p>
                         )}
+
+                        {/* Блок с информацией о токене */}
+                        <div
+                            style={{
+                                marginTop: "1rem",
+                                padding: "0.75rem 1rem",
+                                borderRadius: "12px",
+                                background: "#020617",
+                                border: "1px solid #1e293b",
+                            }}
+                        >
+                            <h2 style={{ fontSize: "1rem", marginBottom: "0.5rem" }}>
+                                ERC-20 токен (USDC)
+                            </h2>
+                            <div>
+                                <span style={{ opacity: 0.7 }}>Токен:</span>{" "}
+                                <span>{wallet.tokenSymbol ?? "—"}</span>
+                            </div>
+                            <div>
+                                <span style={{ opacity: 0.7 }}>Баланс токена:</span>{" "}
+                                <span>
+                  {wallet.tokenBalance
+                      ? `${wallet.tokenBalance} ${wallet.tokenSymbol}`
+                      : "—"}
+                </span>
+                            </div>
+                        </div>
                     </div>
                 )}
 
-                {/* Любая ошибка (нет кошелька, отказ доступа, и т.п.) показывается здесь */}
                 {wallet.status === "error" && (
                     <p style={{ color: "#f97316", marginTop: "0.5rem" }}>
                         Ошибка: {wallet.error}
                     </p>
                 )}
 
-                {/* Небольшой поясняющий текст: важно подчёркивать пользователю,
-            что сейчас dApp лишь читает публичные данные */}
                 <p style={{ marginTop: "1.5rem", fontSize: "0.875rem", opacity: 0.7 }}>
-                    Это демо только читает публичные данные вашего аккаунта и не выполняет
-                    транзакций.
+                    Пример читает публичные данные: ETH баланс и баланс ERC‑20 (USDC) на
+                    Ethereum mainnet. Транзакции не выполняются.
                 </p>
             </div>
         </div>
